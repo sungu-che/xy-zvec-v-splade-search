@@ -979,17 +979,6 @@ HTML_PAGE = r"""
     background: #0f1117; color: #e0e0e0;
     display:flex; flex-direction:column; height:100vh;
   }
-  header {
-    background:#1a1d27; padding:16px 24px;
-    display:flex; align-items:center; gap:16px;
-    border-bottom:1px solid #2a2d3a;
-  }
-  header h1 { font-size:20px; color:#7eb8ff; }
-  .toolbar {
-    padding:12px 24px; display:flex; gap:12px;
-    align-items:center; flex-wrap:wrap;
-    background:#14161f;
-  }
   button {
     background:#2563eb; color:#fff; border:none;
     padding:10px 20px; border-radius:8px; cursor:pointer;
@@ -1094,13 +1083,6 @@ HTML_PAGE = r"""
 </style>
 </head>
 <body>
-
-<header>
-  <h1>🔍 XY Zvec - V Splade Search</h1>
-  <span style="font-size:13px;color:#666;">
-    자연어로 문서를 검색하세요
-  </span>
-</header>
 
 <div class="toolbar">
   <button id="btnDownload" onclick="startDownload()"
