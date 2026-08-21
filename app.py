@@ -230,7 +230,7 @@ class SparseVec:
 
         results = []
         for i in top_idx:
-            if return_zero or scores[i] > 0.0:
+            if scores[i] > 0.0:
                 results.append({
                     "id": self.ids[i],
                     "score": float(scores[i]),
@@ -388,39 +388,9 @@ class Api:
         self._index_meta_path = os.path.join(LOCAL_APP_DATA, "sparse_index.json")
         self._index_state_path = os.path.join(LOCAL_APP_DATA, "index_state.json")
         self._model_dir = os.path.join(LOCAL_APP_DATA, "vsplade-quality")
-        self._history_path = os.path.join(LOCAL_APP_DATA, "search_history.json")  # ← 추가
-        self._load_search_history()  # ← 추가
         logger.info("[Api] 초기화 완료 (PC 언어: %s)", PC_LANGUAGE)
 
-    # ── 검색 히스토리 ──────────────────────────────────────────
-    def _load_search_history(self):
-        try:
-            if os.path.isfile(self._history_path):
-                with open(self._history_path, "r", encoding="utf-8") as f:
-                    self.search_history = json.load(f)
-                logger.info("[히스토리] %d개 로드", len(self.search_history))
-        except Exception as e:
-            logger.warning("[히스토리] 로드 실패: %s", e)
-            self.search_history = []
 
-    def _save_search_history(self):
-        try:
-            # 최근 200개만 유지
-            self.search_history = self.search_history[-200:]
-            with open(self._history_path, "w", encoding="utf-8") as f:
-                json.dump(self.search_history, f, ensure_ascii=False, indent=1)
-        except Exception as e:
-            logger.warning("[히스토리] 저장 실패: %s", e)
-
-    def get_search_history(self):
-        """JS에서 검색 히스토리 조회."""
-        return {"ok": True, "history": self.search_history[-50:]}
-
-    def clear_search_history(self):
-        """검색 히스토리 삭제."""
-        self.search_history = []
-        self._save_search_history()
-        return {"ok": True, "msg": "히스토리 삭제됨"}
 
     # ── 인덱스 상태 저장/복원 ────────────────────────────────
     def _save_index_state(self, folder: str):
@@ -435,24 +405,6 @@ class Api:
             self.last_indexed_folder = folder
         except Exception as e:
             logger.error("[상태] 저장 실패: %s", e)
-
-    def _save_search_result(self, query, translated, results):
-        """검색 결과를 JSONL 파일로 저장 (평가용)."""
-        try:
-            log_path = os.path.join(LOCAL_APP_DATA, "search_log.jsonl")
-            entry = {
-                "time": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "query": query,
-                "translated": translated,
-                "results": [
-                    {"rank": i + 1, "score": round(r["score"], 4), "name": r.get("name", ""), "path": r.get("path", "")}
-                    for i, r in enumerate(results)
-                ],
-            }
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        except Exception as e:
-            logger.warning("[히스토리] 저장 실패: %s", e)
 
     def _try_auto_load_index(self):
         try:
@@ -898,6 +850,27 @@ class Api:
         }
 
     # ── 검색 ─────────────────────────────────────────────────
+    # ── 전체 목록 조회 ─────────────────────────────────────
+    def list_all(self):
+        logger.info("[이벤트] 전체 목록 요청")
+        block = self._check_ready()
+        if block:
+            return block
+        if len(self.svec_db) == 0:
+            return {"ok": False, "msg": "인덱스가 비어 있습니다."}
+        results = []
+        for i in range(len(self.svec_db)):
+            meta = self.svec_db.meta[i]
+            results.append({
+                "id": self.svec_db.ids[i],
+                "path": meta.get("path", ""),
+                "name": meta.get("name", ""),
+            })
+        for r in results:
+            r["thumb_b64"] = self._make_thumb_b64(r.get("path", ""))
+        logger.info("[전체 목록] %d개 반환", len(results))
+        return {"ok": True, "results": results}
+
     def search(self, query: str, top_k: int = 20):
         logger.info("[이벤트] 검색: '%s' (top_k=%d)", query, top_k)
         block = self._check_ready()
@@ -933,8 +906,6 @@ class Api:
             for r in results:
                 r["thumb_b64"] = self._make_thumb_b64(r.get("path", ""))
 
-            # ── 검색 히스토리 저장 ──
-            self._save_search_result(query, translated, results)
 
             return {"ok": True, "results": results, "translated": translated}
         except Exception as e:
@@ -1054,7 +1025,7 @@ HTML_PAGE = r"""
     gap:14px; align-content:start;
   }
   .card {
-    background:#1a1d27; border-radius:10px; overflow:hidden;
+    background:#1a1d27; border-radius:10px;
     border:1px solid #2a2d3a; transition:transform .15s;
   }
   .card:hover { transform:translateY(-3px); }
@@ -1137,7 +1108,6 @@ HTML_PAGE = r"""
   <button id="btnFolder" onclick="selectFolder()" disabled>📁 폴더 선택</button>
   <button id="btnIndex" onclick="startIndexing()" disabled>⚙️ 인덱싱 시작</button>
   <button id="btnLoadIdx" onclick="loadIndex()" disabled>📂 저장된 인덱스 로드</button>
-  <button id="btnHistory" onclick="showHistory()" disabled style="background:#6b21a8;">📜 히스토리</button>
   <button id="btnReset" onclick="resetIndex()" disabled style="background:#dc2626;">🗑️ 인덱스 초기화</button>
   <select id="langSelect" onchange="changeLanguage()" disabled
           style="padding:10px 14px;border-radius:8px;border:1px solid #3a3d4a;
@@ -1145,8 +1115,12 @@ HTML_PAGE = r"""
                  cursor:pointer;">
   </select>
   <div class="search-box">
+    <button id="btnClear" title="검색어 지우기"
+            style="display:none;background:#3a3d4a;padding:10px 14px;"
+            onclick="var i=document.getElementById('searchInput');i.value='';this.style.display='none';i.focus();showAll();">✕</button>
     <input id="searchInput" type="text" disabled
-           placeholder="자연어로 문서 검색…"
+           placeholder="자연어로 문서 검색… (빈칸 엔터 = 전체 목록)"
+           oninput="document.getElementById('btnClear').style.display=this.value?'inline-block':'none'"
            onkeydown="if(event.key==='Enter')doSearch()"/>
     <button id="btnSearch" onclick="doSearch()" disabled>검색</button>
   </div>
@@ -1392,12 +1366,59 @@ async function loadIndex() {
 }
 
 // ── 검색 ──────────────────────────────────────────────────
+function toggleClearBtn() {
+  const v = document.getElementById("searchInput").value;
+  document.getElementById("btnClear").style.display = v ? "inline-block" : "none";
+}
+
+function clearSearch() {
+  const inp = document.getElementById("searchInput");
+  inp.value = "";
+  toggleClearBtn();
+  inp.focus();
+}
+
+async function showAll() {
+  try {
+    setStatus("📋 전체 목록 조회 중...");
+    const res = await pywebview.api.list_all();
+    console.log("[JS] list_all 응답:", res.ok, res.results ? res.results.length : 0);
+    if (!res.ok) { setStatus("⚠️ " + res.msg); return; }
+    renderAll(res.results);
+    setStatus("📋 전체 목록 " + res.results.length + "개");
+  } catch(e) {
+    console.error("[JS] showAll 예외:", e);
+    setStatus("❌ 전체 목록 오류: " + e);
+  }
+}
+
+function renderAll(items) {
+  const g = document.getElementById("gallery");
+  if (!items || items.length === 0) {
+    g.innerHTML = '<div class="empty-msg">인덱스에 항목이 없습니다.</div>';
+    return;
+  }
+  let html = '<div style="grid-column:1/-1;color:#7eb8ff;font-size:13px;padding:4px 0;">📋 전체 목록 (' + items.length + '개)</div>';
+  for (const r of items) {
+    const imgSrc = r.thumb_b64 || "";
+    const safeName = (r.name || "").replace(/'/g, "\\'");
+    html += `
+      <div class="card">
+        <img src="${imgSrc}"
+             onclick="showImageModal(this.src, '${safeName}', '')"
+             onerror="this.style.display='none'"/>
+        <div class="info">📄 ${r.name}</div>
+      </div>`;
+  }
+  g.innerHTML = html;
+}
+
 async function doSearch() {
   const q = document.getElementById("searchInput").value.trim();
   console.log("[JS] doSearch:", q);
-  if (!q) return;
+  if (!modelReady) { setStatus("⚠️ 모델 다운로드 후 이용하세요."); return; }
+  if (!q) { await showAll(); return; }
   try {
-    if (!modelReady) { setStatus("⚠️ 모델 다운로드 후 이용하세요."); return; }
     setStatus("🔍 검색 중: " + q);
     const res = await pywebview.api.search(q, 20);
     console.log("[JS] search 응답:", res.ok, res.results ? res.results.length : 0, "개");
@@ -1429,16 +1450,19 @@ function renderResults(results) {
   }
   let html = "";
   for (const r of results) {
-    const score = (r.score * 100).toFixed(1);
+    // cosine(0~1)는 % 표기, sparse 원점수(1 초과)는 소수점 3자리 표기
+    const scoreTxt = (typeof r.score === "number" && r.score <= 1.0)
+      ? (r.score * 100).toFixed(1) + "%"
+      : (r.score || 0).toFixed(3);
     const imgSrc = r.thumb_b64 || "";
     const safeName = (r.name || "").replace(/'/g, "\\'");
     html += `
       <div class="card">
         <img src="${imgSrc}"
-             onclick="showImageModal(this.src, '${safeName}', '${score}%')"
+             onclick="showImageModal(this.src, '${safeName}', '${scoreTxt}')"
              onerror="this.style.display='none'"/>
         <div class="info">
-          <span class="score">${score}%</span> · ${r.name}
+          <span class="score">${scoreTxt}</span> · ${r.name}
         </div>
       </div>`;
   }
@@ -1509,34 +1533,6 @@ document.addEventListener("keydown", function(e) {
 
 function setStatus(msg) {
   document.getElementById("status").textContent = msg;
-}
-
-async function showHistory() {
-  try {
-    const res = await pywebview.api.get_search_history();
-    if (!res.ok || !res.history || res.history.length === 0) {
-      setStatus("📜 검색 히스토리가 없습니다.");
-      return;
-    }
-    let html = '<div style="grid-column:1/-1;color:#a78bfa;font-size:14px;font-weight:bold;">📜 검색 히스토리 (최근)</div>';
-    for (const h of res.history.slice().reverse()) {
-      const topNames = h.top_results.map(r => `${r.name} (${(r.score*100).toFixed(1)}%)`).join(", ");
-      html += `
-        <div style="grid-column:1/-1;background:#1e1b2e;border:1px solid #3b2d5e;border-radius:8px;padding:10px 14px;margin:2px 0;">
-          <div style="color:#e0e0e0;font-size:13px;">
-            <b style="color:#a78bfa;">"${h.query}"</b>
-            <span style="color:#666;font-size:11px;"> (${h.time})</span>
-            ${h.translated !== h.query ? ` → <span style="color:#888;">${h.translated}</span>` : ''}
-          </div>
-          <div style="color:#888;font-size:11px;margin-top:4px;">${topNames}</div>
-        </div>`;
-    }
-    document.getElementById("gallery").innerHTML = html;
-    setStatus("📜 검색 히스토리 표시 중");
-  } catch(e) {
-    console.error("[JS] showHistory 예외:", e);
-    setStatus("❌ 히스토리 조회 오류: " + e);
-  }
 }
 
 async function resetIndex() {
