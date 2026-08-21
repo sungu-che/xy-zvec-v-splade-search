@@ -191,32 +191,52 @@ class SparseVec:
         if self.matrix is None and self._rows:
             self.matrix = sp.vstack(self._rows, format="csr")
 
-    def search(self, query_vec, top_k: int = 10):
+    def search(self, query_vec, top_k: int = 10, return_zero: bool = True):
         if not self.ids:
             return []
+
         if isinstance(query_vec, torch.Tensor):
-            v = query_vec.float().cpu()
+            v = query_vec.detach().float().cpu()
+            if v.ndim == 2:
+                v = v.squeeze(0)
             nz = v.nonzero(as_tuple=False).squeeze(-1).numpy().astype(np.int64)
             vals = v[nz].numpy().astype(np.float32)
+
             q = sp.csr_matrix(
                 (vals, (np.zeros_like(nz), nz)),
                 shape=(1, self.vocab_size),
             )
+
         elif sp.issparse(query_vec):
             q = query_vec.tocsr()
+
         else:
-            q = query_vec
+            v = np.asarray(query_vec, dtype=np.float32).reshape(-1)
+            nz = np.nonzero(v)[0].astype(np.int64)
+            vals = v[nz].astype(np.float32)
+            q = sp.csr_matrix(
+                (vals, (np.zeros_like(nz), nz)),
+                shape=(1, self.vocab_size),
+            )
+
         self._build_matrix()
-        scores = self.matrix.dot(q.T).toarray().ravel()  # ← .squeeze(0) → .ravel()
+
+        scores = self.matrix.dot(q.T).toarray().ravel()
+
+        # NaN 방지
+        scores = np.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0)
+
         top_idx = np.argsort(scores)[::-1][:top_k]
+
         results = []
         for i in top_idx:
-            if scores[i] > 0.0:
+            if return_zero or scores[i] > 0.0:
                 results.append({
                     "id": self.ids[i],
                     "score": float(scores[i]),
                     **self.meta[i],
                 })
+
         return results
 
     def save(self, path: str):
@@ -363,6 +383,8 @@ class Api:
         self._index_meta_path = os.path.join(LOCAL_APP_DATA, "sparse_index.json")
         self._index_state_path = os.path.join(LOCAL_APP_DATA, "index_state.json")
         self._model_dir = os.path.join(LOCAL_APP_DATA, "vsplade-quality")
+        self._history_path = os.path.join(LOCAL_APP_DATA, "search_history.json")  # ← 추가
+        self._load_search_history()  # ← 추가
         logger.info("[Api] 초기화 완료 (PC 언어: %s)", PC_LANGUAGE)
 
     # ── 검색 히스토리 ──────────────────────────────────────────
@@ -688,6 +710,27 @@ class Api:
         threading.Thread(target=self._index_worker, args=(folder_path,), daemon=True).start()
         return {"ok": True, "msg": "인덱싱 시작"}
 
+    def reset_index(self):
+        """인덱스 전체 초기화 (DB + 디스크 파일 + 갤러리)."""
+        block = self._check_ready()
+        if block:
+            return block
+        if self._indexing:
+            return {"ok": False, "msg": "인덱싱 중에는 초기화할 수 없습니다."}
+        self.svec_db = SparseVec(vocab_size=self.model.model.vocab_size)
+        self.recent_indexed = []
+        self.indexed_count = 0
+        self.total_images = 0
+        self.last_indexed_folder = ""
+        for f in (self._index_path, self._index_meta_path, self._index_state_path):
+            try:
+                if os.path.isfile(f):
+                    os.remove(f)
+            except Exception as e:
+                logger.warning("[리셋] 파일 삭제 실패: %s (%s)", f, e)
+        logger.info("[리셋] 인덱스가 초기화되었습니다.")
+        return {"ok": True, "msg": "인덱스가 초기화되었습니다."}
+
     def _index_worker(self, folder_path: str):
         logger.info("[인덱싱 워커] 시작: %s", folder_path)
         try:
@@ -697,15 +740,15 @@ class Api:
                     if Path(fname).suffix.lower() in IMAGE_EXTS:
                         images.append(os.path.join(root, fname))
 
-            # ── 사전 스캔: PDF 페이지 수까지 포함하여 총 항목 수 계산 ──
+            # ── 사전 스캔: PDF 페이지 수까지 포함 ──
             total_items = 0
-            pdf_page_counts = {}  # {경로: 페이지수}
+            pdf_page_counts = {}
             for p in images:
                 if Path(p).suffix.lower() in PDF_EXTS:
                     try:
                         import fitz
                         doc = fitz.open(p)
-                        page_count = min(len(doc), 10)  # max_pages=10 제한 반영
+                        page_count = min(len(doc), 10)
                         doc.close()
                     except Exception:
                         page_count = 0
@@ -717,27 +760,35 @@ class Api:
             self.total_images = total_items
             self.indexed_count = 0
             self.svec_db = SparseVec(vocab_size=self.model.model.vocab_size)
+            self.recent_indexed = []   # ← 추가: 재인덱싱 시 갤러리 중복 방지
             logger.info("[인덱싱] 총 %d개 항목 (파일 %d개, PDF 페이지 포함), vocab_size=%d",
                         self.total_images, len(images), self.svec_db.vocab_size)
 
+            diag_count = 0  # 진단 로그는 앞의 5개 문서만 출력
             for idx, p in enumerate(images):
                 try:
                     if Path(p).suffix.lower() in PDF_EXTS:
                         pdf_imgs = self._pdf_to_images(p)
                         for page_idx, pi in enumerate(pdf_imgs):
                             vec = self.model.encode_image(pi)
+                            nnz = int((vec > 0).sum())
+                            if nnz == 0:
+                                logger.warning("[인덱싱] ⚠️ 빈 벡터: %s p.%d (nnz=0)", Path(p).name, page_idx + 1)
+                            elif diag_count < 5:
+                                top = self.model.decode_topk(vec, k=5)
+                                logger.info("[인덱싱] %s p.%d nnz=%d | %s",
+                                            Path(p).name, page_idx + 1, nnz,
+                                            ", ".join(f"'{t}'({w:.2f})" for t, w in top))
+                                diag_count += 1
                             vec_id = f"{p}#p{page_idx + 1}"
                             display_name = f"{Path(p).name} (p.{page_idx + 1}/{len(pdf_imgs)})"
                             self.svec_db.add(vec_id, vec, {
-                                "path": p,
-                                "name": display_name,
-                                "page": page_idx + 1,
-                                "total_pages": len(pdf_imgs),
+                                "path": p, "name": display_name,
+                                "page": page_idx + 1, "total_pages": len(pdf_imgs),
                             })
                             self.indexed_count += 1
                             self.recent_indexed.append({
-                                "path": p,
-                                "name": display_name,
+                                "path": p, "name": display_name,
                                 "thumb_b64": self._make_thumb_b64_from_image(pi),
                             })
                             self.progress_msg = f"{self.indexed_count}/{self.total_images} 인덱싱 완료"
@@ -751,24 +802,29 @@ class Api:
                         else:
                             img = img.convert("RGB")
                         vec = self.model.encode_image(img)
+                        nnz = int((vec > 0).sum())
+                        if nnz == 0:
+                            logger.warning("[인덱싱] ⚠️ 빈 벡터: %s (nnz=0)", Path(p).name)
+                        elif diag_count < 5:
+                            top = self.model.decode_topk(vec, k=5)
+                            logger.info("[인덱싱] %s nnz=%d | %s",
+                                        Path(p).name, nnz,
+                                        ", ".join(f"'{t}'({w:.2f})" for t, w in top))
+                            diag_count += 1
                         self.svec_db.add(p, vec, {"path": p, "name": Path(p).name})
                         self.indexed_count += 1
                         self.recent_indexed.append({
-                            "path": p,
-                            "name": Path(p).name,
+                            "path": p, "name": Path(p).name,
                             "thumb_b64": self._make_thumb_b64(p),
                         })
                         self.progress_msg = f"{self.indexed_count}/{self.total_images} 인덱싱 완료"
 
                     if len(self.recent_indexed) > 30:
                         self.recent_indexed = self.recent_indexed[-30:]
-
                     if self.indexed_count % 10 == 0 or self.indexed_count == self.total_images:
                         logger.info("[인덱싱] %s", self.progress_msg)
-
                 except Exception as img_err:
                     logger.warning("[인덱싱] 로드 실패: %s (%s)", p, img_err)
-                    # 실패한 항목도 카운트에 반영 (진행률 정체 방지)
                     if Path(p).suffix.lower() in PDF_EXTS:
                         self.indexed_count += pdf_page_counts.get(p, 0)
                     else:
@@ -845,6 +901,7 @@ class Api:
         except Exception as e:
             logger.error("[검색 오류] %s", e, exc_info=True)
             return {"ok": False, "msg": str(e)}
+
     # ── PDF / 썸네일 ─────────────────────────────────────────
     def _pdf_to_images(self, pdf_path: str, max_pages: int = 10, dpi: int = 150) -> list:
         try:
@@ -1042,6 +1099,7 @@ HTML_PAGE = r"""
   <button id="btnIndex" onclick="startIndexing()" disabled>⚙️ 인덱싱 시작</button>
   <button id="btnLoadIdx" onclick="loadIndex()" disabled>📂 저장된 인덱스 로드</button>
   <button id="btnHistory" onclick="showHistory()" disabled style="background:#6b21a8;">📜 히스토리</button>
+  <button id="btnReset" onclick="resetIndex()" disabled style="background:#dc2626;">🗑️ 인덱스 초기화</button>
   <select id="langSelect" onchange="changeLanguage()" disabled
           style="padding:10px 14px;border-radius:8px;border:1px solid #3a3d4a;
                  background:#1e2130;color:#fff;font-size:14px;outline:none;
@@ -1097,6 +1155,7 @@ function setButtonsEnabled(enabled) {
   document.getElementById("btnSearch").disabled = !enabled;
   document.getElementById("searchInput").disabled = !enabled;
   document.getElementById("langSelect").disabled = !enabled;
+  document.getElementById("btnReset").disabled = !enabled;
 }
 
 // ── 다운로드 폴링 ─────────────────────────────────────────
@@ -1304,17 +1363,14 @@ async function doSearch() {
     const res = await pywebview.api.search(q, 20);
     console.log("[JS] search 응답:", res.ok, res.results ? res.results.length : 0, "개");
     if (!res.ok) { setStatus("❌ " + res.msg); return; }
-    if (res.results.length === 0) {
-      const p = await pywebview.api.get_progress();
-      if (p.recent && p.recent.length > 0) {
-        setStatus("🔍 \"" + q + "\" → 검색 결과 없음. 최근 인덱싱된 이미지를 표시합니다.");
-        renderRecent(p.recent);
-      } else {
-        renderResults([]);
-        setStatus("🔍 \"" + q + "\" → 검색 결과 없음");
-      }
+    
+    // 결과가 없으면 갤러리 비우기
+    if (!res.results || res.results.length === 0) {
+      renderResults([]);
+      setStatus("🔍 \"" + q + "\" → 검색 결과 없음");
       return;
     }
+    
     renderResults(res.results);
     const transInfo = res.translated && res.translated !== q
       ? " (번역: " + res.translated + ")"
@@ -1442,6 +1498,21 @@ async function showHistory() {
     console.error("[JS] showHistory 예외:", e);
     setStatus("❌ 히스토리 조회 오류: " + e);
   }
+}
+
+async function resetIndex() {
+    if (!confirm("인덱스를 완전히 초기화할까요?")) return;
+    try {
+        const res = await pywebview.api.reset_index();
+        setStatus(res.ok ? "✅ " + res.msg : "⚠️ " + res.msg);
+        if (res.ok) {
+            document.getElementById("gallery").innerHTML =
+                '<div class="empty-msg">인덱스가 초기화되었습니다. 폴더를 선택하고 인덱싱하세요.</div>';
+        }
+    } catch(e) {
+        console.error("[JS] resetIndex 예외:", e);
+        setStatus("❌ 초기화 오류: " + e);
+    }
 }
 </script>
 </body>

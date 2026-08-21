@@ -119,35 +119,53 @@ def load_hf_export(model: UnifiedRetriever, hf_dir: str,
         slice_sd = {k[len(prefix):]: v.to(dtype)
                     for k, v in full_sd.items() if k.startswith(prefix)}
 
-        # 원본 키 목록 기억 (pop 전)
         all_slice_keys = list(slice_sd.keys())
 
-        # ── encoder: embedding pad + additional_embedding 처리 ──
+        # ── encoder: tok_embeddings = main + additional concat ──
         if prefix == "encoder.":
             _TOK_KEY = "encoder.model.text_model.embeddings.tok_embeddings.weight"
             _ADD_KEY = "encoder.model.text_model.embeddings.tok_embeddings.additional_embedding.weight"
 
-            # [50368,768] → [50408,768] pad
             if _TOK_KEY in slice_sd:
-                w = slice_sd[_TOK_KEY]
+                main_w = slice_sd[_TOK_KEY]
+                add_w = slice_sd.get(_ADD_KEY)
+                full_w = torch.cat([main_w, add_w], dim=0) if add_w is not None else main_w
+
                 try:
-                    target_emb = module.encoder.model.text_model.embeddings.tok_embeddings
-                    target_size = target_emb.weight.size(0)
+                    target_size = module.encoder.model.text_model.embeddings.tok_embeddings.weight.size(0)
                 except AttributeError:
-                    target_size = w.size(0)
+                    target_size = full_w.size(0)
 
-                if w.size(0) < target_size:
-                    padded = torch.zeros(target_size, w.size(1),
-                                         dtype=w.dtype, device=w.device)
-                    padded[:w.size(0)] = w
-                    slice_sd[_TOK_KEY] = padded
-
-            # additional_embedding은 단일 Embedding 모델에 없으므로 제거
+                if full_w.size(0) < target_size:
+                    p = torch.zeros(target_size, full_w.size(1), dtype=full_w.dtype, device=full_w.device)
+                    p[:full_w.size(0)] = full_w
+                    full_w = p
+                elif full_w.size(0) > target_size:
+                    full_w = full_w[:target_size]
+                slice_sd[_TOK_KEY] = full_w
             slice_sd.pop(_ADD_KEY, None)
 
-        module.load_state_dict(slice_sd, strict=False)
+        incompat = module.load_state_dict(slice_sd, strict=False)
 
-        # pop한 키 포함, 원본 slice 키 전부 consumed로 기록
+        # ★ 핵심: 이름 불일치로 누락된 커넥터 가중치를 shape 매핑으로 주입
+        if getattr(incompat, "missing_keys", None):
+            sd = module.state_dict()
+            remapped = []
+            for miss_key in list(incompat.missing_keys):
+                if "connector" not in miss_key or not miss_key.endswith(".weight"):
+                    continue
+                t_shape = tuple(sd[miss_key].shape)
+                for ck, cv in list(slice_sd.items()):
+                    if tuple(cv.shape) == t_shape:
+                        sd[miss_key] = cv.to(sd[miss_key].dtype)
+                        remapped.append((ck, miss_key))
+                        del slice_sd[ck]
+                        break
+            if remapped:
+                module.load_state_dict(sd, strict=False)
+                for ck, mk in remapped:
+                    print(f"[load_hf_export] remapped: {ck} -> {mk}")
+
         consumed.update(prefix + k for k in all_slice_keys)
 
     leftover = set(full_sd) - consumed
