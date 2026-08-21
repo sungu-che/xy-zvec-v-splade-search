@@ -297,8 +297,13 @@ def load_vsplade_model(model_dir: str):
     from vsplade_inference import VSPLADEInference
 
     device, accel_name = _detect_accelerator()
-    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
-
+    if device.type == "cuda":
+        major, _minor = torch.cuda.get_device_capability()
+        dtype = torch.bfloat16 if major >= 8 else torch.float16
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    else:
+        dtype = torch.float32
     logger.info("[모델] V-SPLADE 로드 중: %s (device=%s, dtype=%s)", model_dir, device, dtype)
     model = VSPLADEInference.from_pretrained(model_dir, device=str(device), dtype=dtype)
 
@@ -765,33 +770,53 @@ class Api:
                         self.total_images, len(images), self.svec_db.vocab_size)
 
             diag_count = 0  # 진단 로그는 앞의 5개 문서만 출력
+            BATCH = int(os.environ.get("VSPLADE_BATCH", "4"))
+            pending: list = []
+
+            def _flush_pending():
+                nonlocal diag_count
+                if not pending:
+                    return
+                pil_imgs = [it["pil"] for it in pending]
+                vecs = self._encode_images_batch(pil_imgs)
+                for it, vec in zip(pending, vecs):
+                    nnz = int((vec > 0).sum())
+                    if nnz == 0:
+                        logger.warning("[인덱싱] ⚠️ 빈 벡터: %s (nnz=0)", it["name"])
+                    elif diag_count < 5:
+                        top = self.model.decode_topk(vec, k=5)
+                        logger.info("[인덱싱] %s nnz=%d | %s", it["name"], nnz,
+                                    ", ".join(f"'{t}'({w:.2f})" for t, w in top))
+                        diag_count += 1
+                    self.svec_db.add(it["vec_id"], vec, it["meta"])
+                    self.indexed_count += 1
+                    thumb = (self._make_thumb_b64_from_image(it["pil"])
+                             if it["is_pdf"] else self._make_thumb_b64(it["path"]))
+                    self.recent_indexed.append({
+                        "path": it["path"], "name": it["name"], "thumb_b64": thumb,
+                    })
+                    self.progress_msg = f"{self.indexed_count}/{self.total_images} 인덱싱 완료"
+                pending.clear()
+                if len(self.recent_indexed) > 30:
+                    self.recent_indexed = self.recent_indexed[-30:]
+                logger.info("[인덱싱] %s", self.progress_msg)
+
             for idx, p in enumerate(images):
                 try:
                     if Path(p).suffix.lower() in PDF_EXTS:
                         pdf_imgs = self._pdf_to_images(p)
                         for page_idx, pi in enumerate(pdf_imgs):
-                            vec = self.model.encode_image(pi)
-                            nnz = int((vec > 0).sum())
-                            if nnz == 0:
-                                logger.warning("[인덱싱] ⚠️ 빈 벡터: %s p.%d (nnz=0)", Path(p).name, page_idx + 1)
-                            elif diag_count < 5:
-                                top = self.model.decode_topk(vec, k=5)
-                                logger.info("[인덱싱] %s p.%d nnz=%d | %s",
-                                            Path(p).name, page_idx + 1, nnz,
-                                            ", ".join(f"'{t}'({w:.2f})" for t, w in top))
-                                diag_count += 1
-                            vec_id = f"{p}#p{page_idx + 1}"
                             display_name = f"{Path(p).name} (p.{page_idx + 1}/{len(pdf_imgs)})"
-                            self.svec_db.add(vec_id, vec, {
-                                "path": p, "name": display_name,
-                                "page": page_idx + 1, "total_pages": len(pdf_imgs),
+                            pending.append({
+                                "pil": pi, "is_pdf": True, "path": p,
+                                "vec_id": f"{p}#p{page_idx + 1}",
+                                "name": display_name,
+                                "meta": {"path": p, "name": display_name,
+                                         "page": page_idx + 1,
+                                         "total_pages": len(pdf_imgs)},
                             })
-                            self.indexed_count += 1
-                            self.recent_indexed.append({
-                                "path": p, "name": display_name,
-                                "thumb_b64": self._make_thumb_b64_from_image(pi),
-                            })
-                            self.progress_msg = f"{self.indexed_count}/{self.total_images} 인덱싱 완료"
+                            if len(pending) >= BATCH:
+                                _flush_pending()
                     else:
                         img = Image.open(p)
                         if img.mode in ("RGBA", "LA", "P"):
@@ -801,28 +826,13 @@ class Api:
                             img = bg
                         else:
                             img = img.convert("RGB")
-                        vec = self.model.encode_image(img)
-                        nnz = int((vec > 0).sum())
-                        if nnz == 0:
-                            logger.warning("[인덱싱] ⚠️ 빈 벡터: %s (nnz=0)", Path(p).name)
-                        elif diag_count < 5:
-                            top = self.model.decode_topk(vec, k=5)
-                            logger.info("[인덱싱] %s nnz=%d | %s",
-                                        Path(p).name, nnz,
-                                        ", ".join(f"'{t}'({w:.2f})" for t, w in top))
-                            diag_count += 1
-                        self.svec_db.add(p, vec, {"path": p, "name": Path(p).name})
-                        self.indexed_count += 1
-                        self.recent_indexed.append({
-                            "path": p, "name": Path(p).name,
-                            "thumb_b64": self._make_thumb_b64(p),
+                        pending.append({
+                            "pil": img, "is_pdf": False, "path": p,
+                            "vec_id": p, "name": Path(p).name,
+                            "meta": {"path": p, "name": Path(p).name},
                         })
-                        self.progress_msg = f"{self.indexed_count}/{self.total_images} 인덱싱 완료"
-
-                    if len(self.recent_indexed) > 30:
-                        self.recent_indexed = self.recent_indexed[-30:]
-                    if self.indexed_count % 10 == 0 or self.indexed_count == self.total_images:
-                        logger.info("[인덱싱] %s", self.progress_msg)
+                        if len(pending) >= BATCH:
+                            _flush_pending()
                 except Exception as img_err:
                     logger.warning("[인덱싱] 로드 실패: %s (%s)", p, img_err)
                     if Path(p).suffix.lower() in PDF_EXTS:
@@ -830,6 +840,7 @@ class Api:
                     else:
                         self.indexed_count += 1
                     continue
+            _flush_pending()
 
             self.svec_db.save(self._index_path)
             self._save_index_state(folder_path)
@@ -841,6 +852,34 @@ class Api:
         finally:
             self._indexing = False
             logger.info("[인덱싱 워커] 종료")
+
+    def _encode_images_batch(self, pil_imgs: list):
+        """이미지 여러 장을 1회 forward로 인코딩. 실패 시 건별 인코딩으로 폴백."""
+        try:
+            prompts = []
+            for _ in pil_imgs:
+                chat = [{"role": "user",
+                         "content": [{"type": "image"}, {"type": "text", "text": ""}]}]
+                prompts.append(
+                    self.model.processor.apply_chat_template(chat, add_generation_prompt=True)
+                )
+            inputs = self.model.processor(
+                images=[im.convert("RGB") for im in pil_imgs],
+                text=prompts,
+                return_tensors="pt",
+            )
+            inputs = {k: (v.to(self.device) if torch.is_tensor(v) else v)
+                      for k, v in inputs.items()}
+            if "pixel_values" in inputs:
+                inputs["pixel_values"] = inputs["pixel_values"].to(self.dtype)
+            with torch.inference_mode():
+                w = self.model.model.encode_passage(**inputs)
+            if isinstance(w, (tuple, list)):
+                w = w[0]
+            return [w[i] for i in range(w.shape[0])]
+        except Exception as e:
+            logger.warning("[인덱싱] 배치 인코딩 실패 → 건별 폴백: %s", e)
+            return [self.model.encode_image(im) for im in pil_imgs]
 
     def get_progress(self):
         recent_out = []

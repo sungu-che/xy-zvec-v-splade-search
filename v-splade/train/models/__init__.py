@@ -116,8 +116,13 @@ def load_hf_export(model: UnifiedRetriever, hf_dir: str,
 
     consumed = set()
     for module, prefix in dispatch:
-        slice_sd = {k[len(prefix):]: v.to(dtype)
-                    for k, v in full_sd.items() if k.startswith(prefix)}
+        # 원본에서 pop하며 이동 → 체크포인트 사본이 중복 상주하지 않음(피크 메모리 절반)
+        slice_sd = {}
+        for k in list(full_sd.keys()):
+            if k.startswith(prefix):
+                v = full_sd.pop(k)
+                slice_sd[k[len(prefix):]] = v if v.dtype == dtype else v.to(dtype)
+                del v
 
         all_slice_keys = list(slice_sd.keys())
 
@@ -174,3 +179,4 @@ def load_hf_export(model: UnifiedRetriever, hf_dir: str,
             f"{len(leftover)} tensor(s) in {hf_dir}/model.safetensors were not "
             f"dispatched to any sub-module. First few: {sorted(leftover)[:3]}"
         )
+    del full_sd, slice_sd
