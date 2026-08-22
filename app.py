@@ -979,6 +979,11 @@ HTML_PAGE = r"""
     background: #0f1117; color: #e0e0e0;
     display:flex; flex-direction:column; height:100vh;
   }
+  .toolbar {
+    padding:12px 24px; display:flex; gap:12px;
+    align-items:center; flex-wrap:wrap;
+    background:#14161f;
+  }
   button {
     background:#2563eb; color:#fff; border:none;
     padding:10px 20px; border-radius:8px; cursor:pointer;
